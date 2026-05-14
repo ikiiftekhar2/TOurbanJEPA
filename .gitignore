@@ -1,11 +1,6 @@
 # Claude Code local settings
 .claude/
 
-# Project planning
-plan.md
-summary.md
-checklist.md
-
 # Data directories (large binary files — only top-level)
 /data/
 
