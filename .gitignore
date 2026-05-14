@@ -4,3 +4,21 @@
 # Project planning
 plan.md
 summary.md
+checklist.md
+
+# Data directories (large binary files — only top-level)
+/data/
+
+# Model weights and checkpoints
+models/ijepa/
+models/vae/
+models/checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Notebook outputs
+notebooks/smoke_test_output/
+.ipynb_checkpoints/
