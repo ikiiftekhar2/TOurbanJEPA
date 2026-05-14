@@ -21,4 +21,10 @@ __pycache__/
 
 # Notebook outputs
 notebooks/smoke_test_output/
+notebooks/*.html
 .ipynb_checkpoints/
+
+# Training artifacts
+runs/
+training_phase*.log
+diagnostic_results.txt

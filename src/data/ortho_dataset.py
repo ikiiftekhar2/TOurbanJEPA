@@ -50,6 +50,8 @@ class OrthoDataset(Dataset):
         train_ratio: float = 0.9,
         augment: bool = True,
         seed: int = 42,
+        patches_per_epoch: int = 4,
+        val_patches_per_tile: int = 4,
     ):
         self.ortho_dir = Path(ortho_dir)
         self.split = split
@@ -75,30 +77,42 @@ class OrthoDataset(Dataset):
             indices = indices[split_idx:]
         self.tiles = [self.tiles[i] for i in indices]
 
-        # For validation: pre-compute a deterministic grid index
-        # (tile_idx, patch_row, patch_col) for every patch in every val tile
+        # For validation: deterministic random subset of grid patches per tile.
+        # Using a fixed seed per tile ensures reproducibility while sampling
+        # spatially diverse positions (not just top-left corner).
+        # Default 4 patches/tile × 416 tiles = 1,664 samples gives SE ≈ σ/40,
+        # sufficient for early stopping (Goodfellow et al. 2016, Bengio 2012).
         if split == "val":
             self._grid: List[Tuple[int, int, int]] = []
+            tile_rng = np.random.RandomState(seed + 1)  # offset seed from split seed
             for tile_idx in range(len(self.tiles)):
-                for pr in range(PATCHES_PER_SIDE):
-                    for pc in range(PATCHES_PER_SIDE):
-                        self._grid.append((tile_idx, pr, pc))
+                all_positions = [(pr, pc) for pr in range(PATCHES_PER_SIDE)
+                                 for pc in range(PATCHES_PER_SIDE)]
+                tile_rng.shuffle(all_positions)
+                for pr, pc in all_positions[:val_patches_per_tile]:
+                    self._grid.append((tile_idx, pr, pc))
         else:
             self._grid = None
 
+        # Train epoch = N random crops per tile (avoids 256 crops/tile being too large)
+        self.patches_per_epoch = patches_per_epoch
+
         self.downsample_scales = DOWNSAMPLE_SCALES
 
+        if split == "train":
+            epoch_size = len(self.tiles) * patches_per_epoch
+        else:
+            epoch_size = len(self._grid)
         print(
             f"OrthoDataset [{split}]: {len(self.tiles):,} tiles, "
-            f"~{len(self.tiles) * PATCHES_PER_TILE:,} possible patches, "
+            f"{epoch_size:,} samples/epoch, "
             f"~15cm/px, scales={self.downsample_scales}"
         )
 
     def __len__(self) -> int:
         if self._grid is not None:
             return len(self._grid)
-        # Train: report patches-per-tile * num_tiles (approximate epoch size)
-        return len(self.tiles) * PATCHES_PER_TILE
+        return len(self.tiles) * self.patches_per_epoch
 
     def _load_tile(self, tile_idx: int) -> np.ndarray:
         """Load a tile and return as HxWxC uint8 numpy array."""
@@ -171,11 +185,13 @@ class OrthoDataset(Dataset):
             tile_idx, pr, pc = self._grid[idx]
             r = pr * self.patch_size
             c = pc * self.patch_size
+            tile_arr = self._load_tile(tile_idx)
         else:
             # Training: random tile and random crop position
             tile_idx = random.randrange(len(self.tiles))
-            tile = Image.open(self.tiles[tile_idx])
+            tile = Image.open(self.tiles[tile_idx]).convert("RGB")
             w, h = tile.size
+            tile_arr = np.array(tile, dtype=np.uint8)
             max_r = max(0, h - self.patch_size)
             max_c = max(0, w - self.patch_size)
             r = random.randint(0, max_r) if max_r > 0 else 0
@@ -183,8 +199,7 @@ class OrthoDataset(Dataset):
 
         tile_path = self.tiles[tile_idx]
 
-        # Load tile and crop
-        tile_arr = self._load_tile(tile_idx)
+        # Crop patch from already-loaded tile
         high_res = self._crop_patch(tile_arr, r, c)
 
         # Downsample
@@ -211,13 +226,17 @@ def create_dataloaders(
     batch_size: int = 8,
     num_workers: int = 4,
     train_ratio: float = 0.9,
+    patches_per_epoch: int = 4,
+    val_patches_per_tile: int = 4,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """Create train and validation dataloaders."""
     train_ds = OrthoDataset(
-        ortho_dir, split="train", train_ratio=train_ratio, augment=True
+        ortho_dir, split="train", train_ratio=train_ratio, augment=True,
+        patches_per_epoch=patches_per_epoch,
     )
     val_ds = OrthoDataset(
-        ortho_dir, split="val", train_ratio=train_ratio, augment=False
+        ortho_dir, split="val", train_ratio=train_ratio, augment=False,
+        val_patches_per_tile=val_patches_per_tile,
     )
 
     train_loader = torch.utils.data.DataLoader(

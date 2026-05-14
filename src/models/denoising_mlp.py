@@ -77,7 +77,7 @@ class DenoisingMLP(nn.Module):
     Applied independently per token, same weights for all tokens.
     """
 
-    def __init__(self, token_dim=4, embed_dim=768, hidden_dim=1024,
+    def __init__(self, token_dim=16, embed_dim=768, hidden_dim=1024,
                  time_dim=256, num_blocks=6):
         super().__init__()
 
