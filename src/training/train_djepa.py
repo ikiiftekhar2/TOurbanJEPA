@@ -71,6 +71,8 @@ def get_args():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr_mlp", type=float, default=1e-3)
     p.add_argument("--lr_jepa", type=float, default=1e-4)
+    p.add_argument("--lr_eta_min", type=float, default=1e-6,
+                   help="Minimum LR for cosine annealing (default: 1e-6)")
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--grad_accum", type=int, default=4)
@@ -213,7 +215,7 @@ def main():
             {"params": model.projection_head.parameters(), "lr": args.lr_jepa},
         ], weight_decay=args.weight_decay, betas=(0.9, 0.95))
 
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=args.lr_eta_min)
 
     # Resume
     start_epoch = 0
