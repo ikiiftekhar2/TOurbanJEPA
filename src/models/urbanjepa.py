@@ -286,13 +286,18 @@ class UrbanJEPA(nn.Module):
     def diffusion_loss(self, tokens, predicted_embeddings, noise_schedule):
         """
         Diffusion loss Ld: MSE between predicted and actual noise.
-        4 noise samples per token. Phase 4 only.
+        4 noise samples per token, importance-weighted timestep sampling.
         """
         B, N, D = tokens.shape
         total_loss = 0.0
 
+        # Importance weights: sqrt(ᾱ_t) * (1 - ᾱ_t) — peaks at middle timesteps
+        # where SNR is changing fastest and learning signal is richest
+        w = torch.sqrt(noise_schedule.alpha_bar) * (1 - noise_schedule.alpha_bar)
+        w = w / w.sum()
+
         for _ in range(4):
-            t = torch.randint(0, noise_schedule.T, (B,), device=tokens.device)
+            t = torch.multinomial(w, B, replacement=True).to(tokens.device)
             x_t, eps = noise_schedule.q_sample(tokens, t)
             eps_pred = self.denoising_mlp(x_t, t, predicted_embeddings)
             total_loss += F.mse_loss(eps_pred, eps)

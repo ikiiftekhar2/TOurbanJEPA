@@ -12,16 +12,19 @@ import torch.nn as nn
 
 class LinearNoiseSchedule:
     """
-    Linear variance schedule for DDPM diffusion.
+    Cosine noise schedule from Improved DDPM (Nichol & Dhariwal, ICML 2021).
 
-    T=1000 steps, β linearly spaced from beta_start to beta_end.
+    T=1000 steps, cosine schedule with offset s=0.008.
     Pre-computes α, ᾱ, √ᾱ, √(1-ᾱ), and posterior variance for fast sampling.
     """
 
-    def __init__(self, T=1000, beta_start=1e-4, beta_end=2e-2, device="cpu"):
+    def __init__(self, T=1000, beta_start=1e-4, beta_end=2e-2, device="cpu", schedule="cosine"):
         self.T = T
 
-        betas = torch.linspace(beta_start, beta_end, T, device=device)
+        if schedule == "cosine":
+            betas = self._cosine_schedule(T, device)
+        else:
+            betas = torch.linspace(beta_start, beta_end, T, device=device)
         alphas = 1.0 - betas
         alpha_bar = torch.cumprod(alphas, dim=0)
         alpha_bar_prev = torch.cat(
@@ -36,6 +39,16 @@ class LinearNoiseSchedule:
         self.sqrt_alpha_bar = torch.sqrt(alpha_bar)
         self.sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar)
         self.posterior_variance = betas * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar)
+
+    @staticmethod
+    def _cosine_schedule(T, device, s=0.008):
+        """Cosine variance schedule from Improved DDPM (Nichol & Dhariwal 2021, Eq 17)."""
+        steps = T + 1
+        x = torch.linspace(0, T, steps, device=device)
+        alphas_cumprod = torch.cos(((x / T) + s) / (1 + s) * torch.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return torch.clamp(betas, max=0.02)
 
     def q_sample(self, x0, t):
         """

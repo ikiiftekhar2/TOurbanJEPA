@@ -243,7 +243,7 @@ def main():
     # --- Noise schedule ---
     noise_schedule = LinearNoiseSchedule(
         T=args.diffusion_T, beta_start=args.beta_start,
-        beta_end=args.beta_end, device=device)
+        beta_end=args.beta_end, device=device, schedule="cosine")
 
     # --- TensorBoard ---
     run_name = f"phase{args.phase}_{time.strftime('%b%d_%H%M')}"
