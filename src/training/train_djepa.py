@@ -60,6 +60,8 @@ def get_args():
     p.add_argument("--jepa_ckpt", type=str,
                    default="models/checkpoints/jepa_best.pt",
                    help="Phase 2 JEPA checkpoint")
+    p.add_argument("--vae_decoder", type=str, default=None,
+                   help="Fine-tuned VAE decoder checkpoint (Tier 2)")
     p.add_argument("--checkpoint_dir", type=str, default="models/checkpoints")
     p.add_argument("--resume", type=str, default=None,
                    help="Resume from Phase 4 checkpoint")
@@ -122,10 +124,14 @@ def load_jepa(model, path, device="cuda"):
     model.target_encoder.load_state_dict(ckpt["target_encoder"])
     model.feature_predictor.load_state_dict(ckpt["feature_predictor"])
     model.projection_head.load_state_dict(ckpt["projection_head"])
-    # Also load denoising MLP if present (enables 4a→4b transition)
+    # Also load denoising MLP if present and architecture matches
     if "denoising_mlp" in ckpt:
-        model.denoising_mlp.load_state_dict(ckpt["denoising_mlp"])
-        print(f"  JEPA + MLP weights from {path}")
+        try:
+            model.denoising_mlp.load_state_dict(ckpt["denoising_mlp"])
+            print(f"  JEPA + denoiser weights from {path}")
+        except (RuntimeError, KeyError):
+            arch = type(model.denoising_mlp).__name__
+            print(f"  JEPA weights from {path} (denoiser arch mismatch — {arch} from scratch)")
     else:
         print(f"  JEPA weights from {path}")
 
@@ -195,6 +201,11 @@ def main():
 
     # VAE
     vae = load_vae(device)
+    if args.vae_decoder:
+        print(f"  Loading fine-tuned VAE decoder from {args.vae_decoder}")
+        dec_ckpt = torch.load(args.vae_decoder, map_location=device, weights_only=True)
+        vae.decoder.load_state_dict(dec_ckpt["decoder"])
+        print(f"  VAE decoder fine-tuned weights loaded")
     model.load_vae(vae)
 
     # Configure trainability
@@ -228,7 +239,12 @@ def main():
         model.target_encoder.load_state_dict(ckpt["target_encoder"])
         model.feature_predictor.load_state_dict(ckpt["feature_predictor"])
         model.projection_head.load_state_dict(ckpt["projection_head"])
-        model.denoising_mlp.load_state_dict(ckpt["denoising_mlp"])
+        try:
+            model.denoising_mlp.load_state_dict(ckpt["denoising_mlp"])
+        except (RuntimeError, KeyError) as e:
+            arch = type(model.denoising_mlp).__name__
+            print(f"  Denoiser arch mismatch — starting {arch} from scratch "
+                  f"({sum(p.numel() for p in model.denoising_mlp.parameters()):,} params)")
         # Only load optimizer/scheduler if same phase (same param groups)
         if saved_phase == args.phase:
             optimizer.load_state_dict(ckpt["optimizer"])
