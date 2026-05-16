@@ -46,6 +46,8 @@ def get_args():
     p.add_argument("--vae_decoder", type=str, default=None,
                    help="Fine-tuned VAE decoder checkpoint")
     p.add_argument("--checkpoint_dir", type=str, default="models/checkpoints")
+    p.add_argument("--exp_name", type=str, default="regress",
+                   help="Experiment name prefix for checkpoints/logs")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--log_dir", type=str, default="runs")
 
@@ -65,6 +67,16 @@ def get_args():
                    choices=["mlp", "conv"],
                    help="mlp=per-token only, conv=per-token + conv refinement")
     p.add_argument("--regressor_hidden", type=int, default=512)
+
+    # Joint training
+    p.add_argument("--unfreeze_jepa", action="store_true", default=False,
+                   help="Jointly fine-tune context_encoder + feature_predictor")
+    p.add_argument("--lr_jepa", type=float, default=1e-4,
+                   help="LR for JEPA encoders (10x lower than regressor)")
+    p.add_argument("--psnr_samples", type=int, default=128,
+                   help="Images for PSNR eval (chunked to avoid OOM)")
+    p.add_argument("--max_steps", type=int, default=None,
+                   help="Cap training steps per epoch (for smoke tests)")
 
     # Logging
     p.add_argument("--log_every", type=int, default=100)
@@ -152,17 +164,28 @@ def main():
         print(f"  VAE decoder fine-tuned weights loaded")
     model.load_vae(vae)
 
-    # Freeze everything except regressor
-    model.train_for_phase("regress")
+    # Freeze everything except regressor (and optionally JEPA encoders)
+    phase = "regress_joint" if args.unfreeze_jepa else "regress"
+    model.train_for_phase(phase)
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in trainable)
-    print(f"Trainable: {n_params:,} params (regressor only)")
+    print(f"Trainable: {n_params:,} params (phase={phase})")
 
-    # --- Optimizer ---
-    optimizer = AdamW(
-        model.latent_regressor.parameters(),
-        lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95),
-    )
+    # --- Optimizer (multi-group for joint training) ---
+    if args.unfreeze_jepa:
+        regressor_params = list(model.latent_regressor.parameters())
+        jepa_params = (list(model.context_encoder.parameters()) +
+                       list(model.feature_predictor.parameters()))
+        optimizer = AdamW([
+            {"params": regressor_params, "lr": args.lr},
+            {"params": jepa_params, "lr": args.lr_jepa},
+        ], weight_decay=args.weight_decay, betas=(0.9, 0.95))
+        print(f"  Joint LR: regressor={args.lr}, jepa={args.lr_jepa}")
+    else:
+        optimizer = AdamW(
+            model.latent_regressor.parameters(),
+            lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95),
+        )
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs,
                                   eta_min=args.lr_eta_min)
 
@@ -172,16 +195,21 @@ def main():
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
         model.latent_regressor.load_state_dict(ckpt["latent_regressor"])
+        if args.unfreeze_jepa:
+            if "context_encoder" in ckpt:
+                model.context_encoder.load_state_dict(ckpt["context_encoder"])
+            if "feature_predictor" in ckpt:
+                model.feature_predictor.load_state_dict(ckpt["feature_predictor"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if scheduler and ckpt.get("scheduler"):
             scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_psnr = ckpt.get("best_psnr", 0.0)
-        model.train_for_phase("regress")
+        model.train_for_phase(phase)
         print(f"Resumed from epoch {start_epoch}, best PSNR={best_psnr:.2f}")
 
     # --- TensorBoard ---
-    run_name = f"regress_{args.regressor_type}_{time.strftime('%b%d_%H%M')}"
+    run_name = f"{args.exp_name}_{time.strftime('%b%d_%H%M')}"
     writer = SummaryWriter(log_dir=str(Path(args.log_dir) / run_name))
     print(f"TensorBoard: {args.log_dir}/{run_name}")
 
@@ -219,6 +247,9 @@ def main():
             nn.utils.clip_grad_norm_(trainable, args.grad_clip)
             optimizer.step()
             global_step += 1
+
+            if args.max_steps and bi >= args.max_steps:
+                break
 
             if bi > 0 and bi % args.log_every == 0:
                 n = bi + 1
@@ -261,29 +292,48 @@ def main():
         val_loss /= len(val_loader)
         val_time = time.time() - t_val
 
-        # --- PSNR evaluation (small subset to avoid VAE decoder OOM) ---
+        # --- PSNR evaluation (chunked VAE decode to avoid OOM) ---
         psnr_val = 0.0
+        psnr_n = 0
+        chunk_size = 8  # VAE decode 8 images at a time
+        first_pred = None
+        first_high = None
         with torch.no_grad():
-            sample_batch = next(iter(val_loader))
-            n_psnr = min(8, sample_batch["low_res"].shape[0])
-            low_s = sample_batch["low_res"][:n_psnr].to(device)
-            high_s = sample_batch["high_res"][:n_psnr].to(device)
+            for psnr_batch in val_loader:
+                low_b = psnr_batch["low_res"].to(device)
+                high_b = psnr_batch["high_res"].to(device)
+                B_b = low_b.shape[0]
 
-            pred_img = model.regress_decode(low_s).clamp(0, 1)
-            mse = nn.functional.mse_loss(
-                pred_img, high_s, reduction="none").mean(dim=[1, 2, 3])
-            psnr_val = (10 * torch.log10(1.0 / mse.clamp(min=1e-8))).mean().item()
+                # Decode in small chunks through VAE
+                for start in range(0, B_b, chunk_size):
+                    if psnr_n >= args.psnr_samples:
+                        break
+                    end = min(start + chunk_size, B_b)
+                    low_chunk = low_b[start:end]
+                    high_chunk = high_b[start:end]
+
+                    pred_chunk = model.regress_decode(low_chunk).clamp(0, 1)
+                    if first_pred is None:
+                        first_pred = pred_chunk
+                        first_high = high_chunk
+                    mse = nn.functional.mse_loss(
+                        pred_chunk, high_chunk, reduction="none").mean(dim=[1, 2, 3])
+                    psnr_val += (10 * torch.log10(1.0 / mse.clamp(min=1e-8))).sum().item()
+                    psnr_n += end - start
+                if psnr_n >= args.psnr_samples:
+                    break
+        psnr_val /= psnr_n
 
         print(f"--- Epoch {epoch:3d} | "
               f"train loss={avg_loss:.4f} | val loss={val_loss:.4f} | "
-              f"PSNR={psnr_val:.2f} dB | "
+              f"PSNR={psnr_val:.2f} dB (n={psnr_n}) | "
               f"T={train_time/60:.0f}m{int(train_time)%60:02.0f}s "
               f"V={val_time/60:.0f}m{int(val_time)%60:02.0f}s ---")
 
         writer.add_scalar("val/loss", val_loss, epoch)
         writer.add_scalar("val/PSNR", psnr_val, epoch)
-        writer.add_images("val/predicted", pred_img, epoch)
-        writer.add_images("val/ground_truth", high_s, epoch)
+        writer.add_images("val/predicted", first_pred, epoch)
+        writer.add_images("val/ground_truth", first_high, epoch)
 
         # Best tracking (by PSNR)
         improved = psnr_val > best_psnr
@@ -293,7 +343,7 @@ def main():
             best_epoch = epoch
             patience_ctr = 0
             save_ckpt(model, optimizer, scheduler, epoch,
-                      f"{args.checkpoint_dir}/regress_best.pt", best_psnr)
+                      f"{args.checkpoint_dir}/{args.exp_name}_best.pt", best_psnr)
             print(f"  New best PSNR={best_psnr:.2f} dB")
         else:
             patience_ctr += 1
@@ -305,12 +355,12 @@ def main():
 
         if (epoch + 1) % args.checkpoint_every == 0:
             save_ckpt(model, optimizer, scheduler, epoch,
-                      f"{args.checkpoint_dir}/regress_epoch_{epoch}.pt", best_psnr)
+                      f"{args.checkpoint_dir}/{args.exp_name}_epoch_{epoch}.pt", best_psnr)
 
     # Final save
     if patience_ctr < args.patience or args.no_early_stop:
         save_ckpt(model, optimizer, scheduler, epoch,
-                  f"{args.checkpoint_dir}/regress_final.pt", best_psnr)
+                  f"{args.checkpoint_dir}/{args.exp_name}_final.pt", best_psnr)
 
     writer.close()
     print(f"\nPath B done. Best: epoch {best_epoch} PSNR={best_psnr:.2f} dB")

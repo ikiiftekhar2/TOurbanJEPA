@@ -294,6 +294,14 @@ class UrbanJEPA(nn.Module):
             for p in self.latent_regressor.parameters():
                 p.requires_grad = True
 
+        elif phase == "regress_joint":
+            for p in self.context_encoder.parameters():
+                p.requires_grad = True
+            for p in self.feature_predictor.parameters():
+                p.requires_grad = True
+            for p in self.latent_regressor.parameters():
+                p.requires_grad = True
+
         elif phase == "joint":
             for p in self.context_encoder.parameters():
                 p.requires_grad = True
