@@ -261,12 +261,13 @@ def main():
         val_loss /= len(val_loader)
         val_time = time.time() - t_val
 
-        # --- PSNR evaluation ---
+        # --- PSNR evaluation (small subset to avoid VAE decoder OOM) ---
         psnr_val = 0.0
         with torch.no_grad():
             sample_batch = next(iter(val_loader))
-            low_s = sample_batch["low_res"].to(device)
-            high_s = sample_batch["high_res"].to(device)
+            n_psnr = min(8, sample_batch["low_res"].shape[0])
+            low_s = sample_batch["low_res"][:n_psnr].to(device)
+            high_s = sample_batch["high_res"][:n_psnr].to(device)
 
             pred_img = model.regress_decode(low_s).clamp(0, 1)
             mse = nn.functional.mse_loss(
