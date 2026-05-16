@@ -24,15 +24,50 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torchvision.models import vgg16, VGG16_Weights
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.models.urbanjepa import UrbanJEPA
 from src.data.ortho_dataset import OrthoDataset
+
+
+class VGGPerceptualLoss(nn.Module):
+    """L1 distance between VGG16 feature maps at multiple layers."""
+
+    def __init__(self, device="cuda"):
+        super().__init__()
+        vgg = vgg16(weights=VGG16_Weights.DEFAULT).to(device)
+        vgg.eval()
+        for p in vgg.parameters():
+            p.requires_grad = False
+
+        self.slices = nn.ModuleList([
+            vgg.features[:4],    # relu1_2  (64 ch)
+            vgg.features[:9],    # relu2_2  (128 ch)
+            vgg.features[:16],   # relu3_3  (256 ch)
+        ])
+        self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    def forward(self, pred, target):
+        d = pred.device
+        mean = self.mean.to(d) if self.mean.device != d else self.mean
+        std = self.std.to(d) if self.std.device != d else self.std
+        pred_n = (pred - mean) / std
+        target_n = (target - mean) / std
+
+        loss = 0.0
+        for layer in self.slices:
+            p_feat = layer(pred_n)
+            t_feat = layer(target_n)
+            loss += F.l1_loss(p_feat, t_feat)
+        return loss / len(self.slices)
 
 
 def get_args():
@@ -49,6 +84,8 @@ def get_args():
     p.add_argument("--exp_name", type=str, default="regress",
                    help="Experiment name prefix for checkpoints/logs")
     p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--warmstart_regressor", type=str, default=None,
+                   help="Initialize regressor weights from this checkpoint")
     p.add_argument("--log_dir", type=str, default="runs")
 
     # Hyperparams
@@ -163,6 +200,16 @@ def main():
         vae.decoder.load_state_dict(dec_ckpt["decoder"])
         print(f"  VAE decoder fine-tuned weights loaded")
     model.load_vae(vae)
+
+    # Warm-start regressor from another experiment's checkpoint
+    if args.warmstart_regressor:
+        ws = torch.load(args.warmstart_regressor, map_location=device, weights_only=True)
+        model.latent_regressor.load_state_dict(ws["latent_regressor"])
+        print(f"  Regressor warm-started from {args.warmstart_regressor}")
+
+    # Perceptual loss for validation metrics only (not training)
+    perceptual = VGGPerceptualLoss(device)
+    print("VGG perceptual loss ready (relu1_2, relu2_2, relu3_3)")
 
     # Freeze everything except regressor (and optionally JEPA encoders)
     phase = "regress_joint" if args.unfreeze_jepa else "regress"
@@ -292,8 +339,10 @@ def main():
         val_loss /= len(val_loader)
         val_time = time.time() - t_val
 
-        # --- PSNR evaluation (chunked VAE decode to avoid OOM) ---
+        # --- PSNR / L1 / perceptual evaluation (chunked VAE decode to avoid OOM) ---
         psnr_val = 0.0
+        l1_val = 0.0
+        percep_val = 0.0
         psnr_n = 0
         chunk_size = 8  # VAE decode 8 images at a time
         first_pred = None
@@ -316,22 +365,29 @@ def main():
                     if first_pred is None:
                         first_pred = pred_chunk
                         first_high = high_chunk
-                    mse = nn.functional.mse_loss(
+
+                    mse = F.mse_loss(
                         pred_chunk, high_chunk, reduction="none").mean(dim=[1, 2, 3])
                     psnr_val += (10 * torch.log10(1.0 / mse.clamp(min=1e-8))).sum().item()
+                    l1_val += F.l1_loss(pred_chunk, high_chunk).item() * (end - start)
+                    percep_val += perceptual(pred_chunk, high_chunk).item() * (end - start)
                     psnr_n += end - start
                 if psnr_n >= args.psnr_samples:
                     break
         psnr_val /= psnr_n
+        l1_val /= psnr_n
+        percep_val /= psnr_n
 
         print(f"--- Epoch {epoch:3d} | "
               f"train loss={avg_loss:.4f} | val loss={val_loss:.4f} | "
-              f"PSNR={psnr_val:.2f} dB (n={psnr_n}) | "
+              f"PSNR={psnr_val:.2f} dB L1={l1_val:.4f} perc={percep_val:.4f} (n={psnr_n}) | "
               f"T={train_time/60:.0f}m{int(train_time)%60:02.0f}s "
               f"V={val_time/60:.0f}m{int(val_time)%60:02.0f}s ---")
 
         writer.add_scalar("val/loss", val_loss, epoch)
         writer.add_scalar("val/PSNR", psnr_val, epoch)
+        writer.add_scalar("val/L1", l1_val, epoch)
+        writer.add_scalar("val/perceptual", percep_val, epoch)
         writer.add_images("val/predicted", first_pred, epoch)
         writer.add_images("val/ground_truth", first_high, epoch)
 

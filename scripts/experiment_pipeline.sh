@@ -19,12 +19,12 @@ STATE_FILE="${PROJECT_DIR}/scripts/.pipeline_state"
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
 
 # --- Experiment definitions ---
-# Format: exp_name|regressor_type|hidden|unfreeze|epochs|lr_eta_min|description
+# Format: exp_name|regressor_type|hidden|unfreeze|epochs|lr_eta_min|warmstart_from|description
 EXPERIMENTS=(
-    "exp1_mlp|mlp|512|0|20|1e-5|MLP baseline (666K)"
-    "exp2_conv|conv|512|0|20|1e-5|Conv refinement (2.5M)"
-    "exp3_conv_wide|conv|1024|0|30|1e-6|Conv + wider hidden (~5M)"
-    "exp4_joint|conv|1024|1|40|1e-6|Conv + wide + joint training"
+    "exp1_mlp|mlp|512|0|20|1e-5||MLP baseline (666K)"
+    "exp2_conv|conv|512|0|20|1e-5||Conv refinement (2.5M)"
+    "exp3_conv_wide|conv|1024|0|30|1e-6||Conv + wider hidden (~5M)"
+    "exp4_joint|conv|1024|1|40|1e-6|exp3_conv_wide|Conv + wide + joint — warmstart from exp3 regressor"
 )
 
 COMMON_FLAGS=(
@@ -112,7 +112,7 @@ smoke_test() {
     local passed=0 failed=0
 
     for exp_def in "${EXPERIMENTS[@]}"; do
-        IFS='|' read -r name rtype hidden unfreeze epochs lr_min desc <<< "$exp_def"
+        IFS='|' read -r name rtype hidden unfreeze epochs lr_min warmstart_from desc <<< "$exp_def"
 
         log ""
         log "--- Testing: ${name} (${desc}) ---"
@@ -175,7 +175,7 @@ train() {
     log "===== PIPELINE TRAIN START ====="
 
     for exp_def in "${EXPERIMENTS[@]}"; do
-        IFS='|' read -r name rtype hidden unfreeze epochs lr_min desc <<< "$exp_def"
+        IFS='|' read -r name rtype hidden unfreeze epochs lr_min warmstart_from desc <<< "$exp_def"
 
         # Skip if already done
         if is_exp_done "$name"; then
@@ -212,6 +212,20 @@ train() {
             CMD+=(--resume "$ckpt_path")
         else
             log "  Starting fresh (no checkpoint found)"
+        fi
+
+        # Warm-start regressor from a previous experiment's checkpoint (first run only)
+        if [ -z "$ckpt_path" ] && [ -n "$warmstart_from" ]; then
+            local ws_ckpt="${CKPT_DIR}/${warmstart_from}_best.pt"
+            if [ ! -f "$ws_ckpt" ]; then
+                ws_ckpt="${CKPT_DIR}/${warmstart_from}_final.pt"
+            fi
+            if [ -f "$ws_ckpt" ]; then
+                log "  Warm-starting regressor from ${warmstart_from}: ${ws_ckpt}"
+                CMD+=(--warmstart_regressor "$ws_ckpt")
+            else
+                log "  WARNING: warmstart checkpoint ${warmstart_from} not found, using random init"
+            fi
         fi
 
         log "  Launching: ${CMD[*]}"
