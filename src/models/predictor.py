@@ -13,6 +13,7 @@ VAE latent grid (2×2 spatial groups of 4-channel latents = 16-dim).
 
 import torch
 import torch.nn as nn
+from timm.models.layers import DropPath
 from .encoder import build_vit_base
 
 
@@ -25,7 +26,7 @@ class FeaturePredictor(nn.Module):
     """
 
     def __init__(self, pretrained_path=None, embed_dim=768, depth=12,
-                 num_heads=12, max_tokens=256):
+                 num_heads=12, max_tokens=256, drop_path_rate=0.0):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -35,6 +36,10 @@ class FeaturePredictor(nn.Module):
 
         if pretrained_path:
             self._load_pretrained_blocks(vit, pretrained_path)
+
+        if drop_path_rate > 0.0:
+            for i, block in enumerate(vit.blocks):
+                block.drop_path = DropPath(drop_path_rate * i / (depth - 1))
 
         self.blocks = vit.blocks      # transformer encoder blocks (ModuleList)
         self.norm = vit.norm          # final LayerNorm

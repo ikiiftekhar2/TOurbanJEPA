@@ -9,6 +9,7 @@ to the ortho domain.
 
 import torch
 import torch.nn as nn
+from timm.models.layers import DropPath
 
 
 def build_vit_base(img_size=256, patch_size=16):
@@ -38,7 +39,7 @@ class UrbanEncoder(nn.Module):
     """
 
     def __init__(self, pretrained_path=None, img_size=256, patch_size=16,
-                 embed_dim=768, depth=12, num_heads=12):
+                 embed_dim=768, depth=12, num_heads=12, drop_path_rate=0.0):
         super().__init__()
 
         self.img_size = img_size
@@ -47,6 +48,10 @@ class UrbanEncoder(nn.Module):
         self.num_patches = (img_size // patch_size) ** 2
 
         self.vit = build_vit_base(img_size=img_size, patch_size=patch_size)
+
+        if drop_path_rate > 0.0:
+            for i, block in enumerate(self.vit.blocks):
+                block.drop_path = DropPath(drop_path_rate * i / (depth - 1))
 
         if pretrained_path:
             self._load_pretrained(pretrained_path)

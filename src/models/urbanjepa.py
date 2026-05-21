@@ -1,24 +1,20 @@
 """
-UrbanJEPA: Full D-JEPA model for urban image super-resolution.
+UrbanJEPA: JEPA model for urban image super-resolution.
 
 Unified token space — ViT and VAE latent use the same 256-token grid:
     ViT-B/16 on 256×256 pixels: 16×16 patches = 256 tokens
     SD-VAE on 256×256 pixels: 32×32×4 latents → group 2×2 → 16×16×16 = 256 tokens × 16-dim
 
-Phase 2 (embedding space only):
+JEPA (embedding space):
     low_res → context_encoder → ctx_features       (256 tokens, 768-dim)
     high_res → target_encoder → target_embeddings   (256 tokens, 768-dim, stop grad, EMA)
     ctx_features + mask → feature_predictor → predicted_embeddings
     projection_head(predicted) ↔ target → Smooth L1 loss
 
-Phase 4 (adds diffusion in latent space):
-    Same JEPA pipeline + VAE encode (2×2 grouped) + Denoising MLP + VAE decode
-
 Components:
     context_encoder (φ)  — ViT-B/16, trained
     target_encoder (φ̄)  — ViT-B/16, EMA-only
     feature_predictor (γ) — ViT-B/16 + mask tokens, trained
-    denoising_mlp (εθ)   — 6-block residual MLP, token_dim=16 (Phase 4)
     vae_encoder          — SD-VAE, frozen
     vae_decoder          — SD-VAE, frozen initially
     projection_head (uθ) — 2-layer MLP, trained
@@ -31,8 +27,6 @@ import torch.nn.functional as F
 
 from .encoder import UrbanEncoder
 from .predictor import FeaturePredictor
-from .denoising_mlp import TransformerDenoiser, DenoisingMLP
-from .latent_regressor import LatentRegressor, LatentRegressorConv
 
 
 class UrbanJEPA(nn.Module):
@@ -45,15 +39,8 @@ class UrbanJEPA(nn.Module):
         depth=12,
         num_heads=12,
         token_dim=16,
-        mlp_hidden_dim=1024,
-        mlp_blocks=6,
         ema_decay=0.9999,
-        denoiser_type="transformer",
-        denoiser_d_model=512,
-        denoiser_heads=8,
-        denoiser_layers=6,
-        regressor_type="mlp",
-        regressor_hidden=512,
+        drop_path_rate=0.0,
     ):
         super().__init__()
 
@@ -72,6 +59,7 @@ class UrbanJEPA(nn.Module):
             embed_dim=embed_dim,
             depth=depth,
             num_heads=num_heads,
+            drop_path_rate=drop_path_rate,
         )
 
         self.target_encoder = UrbanEncoder(
@@ -81,6 +69,7 @@ class UrbanJEPA(nn.Module):
             embed_dim=embed_dim,
             depth=depth,
             num_heads=num_heads,
+            drop_path_rate=drop_path_rate,
         )
 
         # Target encoder receives NO gradients — updated via EMA only
@@ -99,53 +88,24 @@ class UrbanJEPA(nn.Module):
             depth=depth,
             num_heads=num_heads,
             max_tokens=self.num_patches,
+            drop_path_rate=drop_path_rate,
         )
 
         # --- Projection Head (uθ) ---
         self.projection_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.SiLU(),
+            nn.Dropout(0.1),
             nn.Linear(embed_dim, embed_dim),
         )
 
-        # --- Denoiser (Phase 4) ---
-        # TransformerDenoiser: DiT-style with cross-token self-attention (~31M params)
-        # DenoisingMLP: legacy per-token MLP (~4M params), use via --legacy_mlp
-        if denoiser_type == "transformer":
-            self.denoising_mlp = TransformerDenoiser(
-                token_dim=token_dim,
-                embed_dim=embed_dim,
-                d_model=denoiser_d_model,
-                num_heads=denoiser_heads,
-                num_layers=denoiser_layers,
-            )
-        else:
-            self.denoising_mlp = DenoisingMLP(
-                token_dim=token_dim,
-                embed_dim=embed_dim,
-                hidden_dim=mlp_hidden_dim,
-                num_blocks=mlp_blocks,
-            )
-
-        # --- Latent Regressor (Path B) ---
-        if regressor_type == "conv":
-            self.latent_regressor = LatentRegressorConv(
-                embed_dim=embed_dim,
-                hidden_dim=regressor_hidden,
-            )
-        else:
-            self.latent_regressor = LatentRegressor(
-                embed_dim=embed_dim,
-                hidden_dim=regressor_hidden,
-            )
-
-        # --- VAE (Phase 4, loaded separately) ---
+        # --- VAE (loaded separately) ---
         self.vae = None
         self._vae_loaded = False
 
     def load_vae(self, vae):
-        """Load SD-VAE for Phase 4. vae is an AutoencoderKL from diffusers."""
-        self.vae = vae
+        """Load SD-VAE. Converts to fp32 — targets must be fp32 precision."""
+        self.vae = vae.to(torch.float32)
         self._vae_loaded = True
 
     @torch.no_grad()
@@ -185,14 +145,15 @@ class UrbanJEPA(nn.Module):
 
     def forward(self, low_res, high_res):
         """
-        Phase 2 forward pass — prediction loss only (no diffusion).
+        JEPA forward pass — predicts ALL tokens for downstream pixel loss.
 
         low_res:  (B, 3, 256, 256) downsampled ortho
         high_res: (B, 3, 256, 256) high-res ortho crop
-        Returns: dict with 'loss' and 'loss_prediction'
+        Returns: dict with 'loss', 'loss_prediction', 'cos_sim', 'predicted_all'
         """
         B = low_res.shape[0]
         N = self.num_patches
+        device = low_res.device
 
         # Context encoder: process low-res input
         ctx_features = self.context_encoder(low_res)  # (B, N, D)
@@ -201,124 +162,38 @@ class UrbanJEPA(nn.Module):
         with torch.no_grad():
             target_embeddings = self.target_encoder(high_res)  # (B, N, D)
 
-        # Sample mask on the token index axis
+        # Sample mask for JEPA loss
         mask_idx, _ = self.sample_mask(N)
-        mask_idx = mask_idx.to(low_res.device)
-
-        # Expand mask_idx for batch
+        mask_idx = mask_idx.to(device)
         mask_idx_b = mask_idx.unsqueeze(0).expand(B, -1)  # (B, N_mask)
 
-        # Predict embeddings for masked positions
-        predicted_embeddings = self.feature_predictor(
-            ctx_features, mask_idx_b
-        )  # (B, N_mask, D)
+        # Predict ALL 256 tokens from context (needed for pixel loss)
+        all_positions = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)
+        all_predicted = self.feature_predictor(ctx_features, all_positions)  # (B, N, D)
 
-        # Target embeddings at masked positions
+        # Slice masked positions for JEPA loss
+        predicted_masked = all_predicted.gather(
+            1, mask_idx_b.unsqueeze(-1).expand(-1, -1, self.embed_dim)
+        )  # (B, N_mask, D)
         target_masked = target_embeddings.gather(
             1, mask_idx_b.unsqueeze(-1).expand(-1, -1, self.embed_dim)
         )  # (B, N_mask, D)
 
-        # Compute prediction loss
-        Lp = self.prediction_loss(predicted_embeddings, target_masked)
+        # JEPA prediction loss + cosine similarity
+        projected = self.projection_head(predicted_masked)
+        cos_sim = F.cosine_similarity(projected, target_masked.detach(), dim=-1).mean()
+        Lp = F.smooth_l1_loss(projected, target_masked.detach())
 
         return {
             "loss": Lp,
             "loss_prediction": Lp.item(),
+            "cos_sim": cos_sim.item(),
+            "predicted_all": all_predicted,  # (B, N, D) for pixel loss
         }
 
     # ------------------------------------------------------------------
-    # Path B: Direct latent regression (skip diffusion)
+    # VAE latent encoding/decoding
     # ------------------------------------------------------------------
-
-    def forward_regress(self, low_res):
-        """
-        Path B forward: context_encoder → latent_regressor → VAE latent.
-
-        low_res: (B, 3, 256, 256) downsampled ortho
-        Returns: (B, 4, 32, 32) predicted VAE latent (scaled)
-        """
-        ctx_features = self.context_encoder(low_res)  # (B, 256, 768)
-        return self.latent_regressor(ctx_features)     # (B, 4, 32, 32)
-
-    def regress_decode(self, low_res):
-        """
-        Full Path B pipeline: low_res → regressor → VAE decode → pixel image.
-        Convenience for evaluation.
-        """
-        latent = self.forward_regress(low_res)
-        return self.decode_from_latent_2d(latent)
-
-    def decode_from_latent_2d(self, latent_2d):
-        """
-        Decode a (B, 4, 32, 32) latent directly (no token grouping step).
-
-        Unlike decode_from_latent which expects (B, 256, 16) tokens,
-        this takes the native VAE latent format.
-        """
-        if not self._vae_loaded:
-            raise RuntimeError("VAE not loaded. Call load_vae() first.")
-        vae_dtype = next(self.vae.parameters()).dtype
-        latents = latent_2d / 0.18215
-        images = self.vae.decode(latents.to(vae_dtype)).sample
-        return images.float()
-
-    # ------------------------------------------------------------------
-    # Phase 4 methods (stubs — unused in Phase 2)
-    # ------------------------------------------------------------------
-
-    def train_for_phase(self, phase):
-        """
-        Configure which parameters are trainable for the current phase.
-
-        phase='jepa':  context_encoder + feature_predictor + projection_head
-        phase='mlp':   denoising_mlp only (everything else frozen)
-        phase='joint': all components jointly
-        """
-        # Freeze everything first
-        for p in self.parameters():
-            p.requires_grad = False
-
-        if phase == "jepa":
-            for p in self.context_encoder.parameters():
-                p.requires_grad = True
-            for p in self.feature_predictor.parameters():
-                p.requires_grad = True
-            for p in self.projection_head.parameters():
-                p.requires_grad = True
-
-        elif phase == "mlp":
-            for p in self.denoising_mlp.parameters():
-                p.requires_grad = True
-
-        elif phase == "regress":
-            for p in self.latent_regressor.parameters():
-                p.requires_grad = True
-
-        elif phase == "regress_joint":
-            for p in self.context_encoder.parameters():
-                p.requires_grad = True
-            for p in self.feature_predictor.parameters():
-                p.requires_grad = True
-            for p in self.latent_regressor.parameters():
-                p.requires_grad = True
-
-        elif phase == "joint":
-            for p in self.context_encoder.parameters():
-                p.requires_grad = True
-            for p in self.feature_predictor.parameters():
-                p.requires_grad = True
-            for p in self.projection_head.parameters():
-                p.requires_grad = True
-            for p in self.denoising_mlp.parameters():
-                p.requires_grad = True
-
-        elif phase == "all":
-            for p in self.parameters():
-                p.requires_grad = True
-
-        # Target encoder NEVER receives gradients
-        for p in self.target_encoder.parameters():
-            p.requires_grad = False
 
     def encode_to_latent(self, images):
         """
@@ -330,7 +205,7 @@ class UrbanJEPA(nn.Module):
             raise RuntimeError("VAE not loaded. Call load_vae() first.")
         vae_dtype = next(self.vae.parameters()).dtype
         with torch.no_grad():
-            latents = self.vae.encode(images.to(vae_dtype)).latent_dist.sample()
+            latents = self.vae.encode(images.to(vae_dtype)).latent_dist.mean
             latents = latents * 0.18215  # SD-VAE scaling
         B, C, H, W = latents.shape  # (B, 4, 32, 32)
 
@@ -360,42 +235,3 @@ class UrbanJEPA(nn.Module):
         latents = latents / 0.18215
         images = self.vae.decode(latents.to(vae_dtype)).sample
         return images.float()
-
-    def diffusion_loss(self, tokens, predicted_embeddings, noise_schedule):
-        """
-        Diffusion loss Ld: MSE between predicted and actual noise.
-        4 noise samples per token, importance-weighted timestep sampling.
-        """
-        B, N, D = tokens.shape
-        total_loss = 0.0
-
-        # Importance weights: sqrt(ᾱ_t) * (1 - ᾱ_t) — peaks at middle timesteps
-        # where SNR is changing fastest and learning signal is richest
-        w = torch.sqrt(noise_schedule.alpha_bar) * (1 - noise_schedule.alpha_bar)
-        w = w / w.sum()
-
-        for _ in range(8):
-            t = torch.multinomial(w, B, replacement=True).to(tokens.device)
-            x_t, eps = noise_schedule.q_sample(tokens, t)
-            eps_pred = self.denoising_mlp(x_t, t, predicted_embeddings)
-            total_loss += F.mse_loss(eps_pred, eps)
-
-        return total_loss / 8.0
-
-    @torch.no_grad()
-    def ddpm_sample(self, cond, noise_schedule, num_steps=50, temperature=0.98):
-        """
-        Generate latent tokens via DDPM reverse process.
-
-        cond:       (B, N, embed_dim) JEPA predicted features
-        num_steps:  reverse steps (strided across full T range for speed)
-        Returns:    (B, N, token_dim) denoised VAE latent tokens
-        """
-        B, N, D = cond.shape[0], cond.shape[1], self.token_dim
-        return noise_schedule.p_sample_loop(
-            (B, N, D),
-            lambda x_t, t, z: self.denoising_mlp(x_t, t, z),
-            cond,
-            num_steps=num_steps,
-            temperature=temperature,
-        )

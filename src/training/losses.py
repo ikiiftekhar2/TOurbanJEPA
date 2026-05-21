@@ -1,135 +1,48 @@
-"""
-Linear noise schedule from ADM (Dhariwal & Nichol, NeurIPS 2021).
-Used by the Denoising MLP in Phase 4 D-JEPA training.
-
-β ∈ [1e-4, 2e-2], T=1000, linear variance schedule.
-Pre-computes alpha_bar values for efficient forward/reverse diffusion.
-"""
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import vgg16, VGG16_Weights
 
 
-class LinearNoiseSchedule:
-    """
-    Cosine noise schedule from Improved DDPM (Nichol & Dhariwal, ICML 2021).
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, device="cuda"):
+        super().__init__()
+        vgg = vgg16(weights=VGG16_Weights.DEFAULT).to(device).eval()
+        for p in vgg.parameters():
+            p.requires_grad = False
+        self.slices = nn.ModuleList([
+            vgg.features[:4],   # relu1_2
+            vgg.features[:9],   # relu2_2
+            vgg.features[:16],  # relu3_3
+            vgg.features[:23],  # relu4_3
+        ])
+        self.register_buffer('mean',
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std',
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    T=1000 steps, cosine schedule with offset s=0.008.
-    Pre-computes α, ᾱ, √ᾱ, √(1-ᾱ), and posterior variance for fast sampling.
-    """
+    def forward(self, pred, target):
+        pred = (pred - self.mean) / self.std
+        target = (target - self.mean) / self.std
+        loss = 0.0
+        for s in self.slices:
+            loss += F.l1_loss(s(pred), s(target))
+        return loss / len(self.slices)
 
-    def __init__(self, T=1000, beta_start=1e-4, beta_end=2e-2, device="cpu", schedule="cosine"):
-        self.T = T
 
-        if schedule == "cosine":
-            betas = self._cosine_schedule(T, device)
-        else:
-            betas = torch.linspace(beta_start, beta_end, T, device=device)
-        alphas = 1.0 - betas
-        alpha_bar = torch.cumprod(alphas, dim=0)
-        alpha_bar_prev = torch.cat(
-            [torch.ones(1, device=device), alpha_bar[:-1]]
-        )
+def high_frequency_loss(pred, target, cutoff_ratio=0.125):
+    """L1 on high-freq components via FFT."""
+    B, C, H, W = pred.shape
+    cy, cx = H // 2, W // 2
+    ry, rx = int(H * cutoff_ratio), int(W * cutoff_ratio)
 
-        self.betas = betas
-        self.alphas = alphas
-        self.alpha_bar = alpha_bar
-        self.alpha_bar_prev = alpha_bar_prev
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=pred.device),
+        torch.arange(W, device=pred.device), indexing='ij')
+    mask = ((yy - cy).float() / max(ry, 1)) ** 2 + \
+           ((xx - cx).float() / max(rx, 1)) ** 2 >= 1.0
+    mask = torch.fft.fftshift(mask.float()).unsqueeze(0).unsqueeze(0)
 
-        self.sqrt_alpha_bar = torch.sqrt(alpha_bar)
-        self.sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar)
-        self.posterior_variance = betas * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar)
-
-    @staticmethod
-    def _cosine_schedule(T, device, s=0.008):
-        """Cosine variance schedule from Improved DDPM (Nichol & Dhariwal 2021, Eq 17)."""
-        steps = T + 1
-        x = torch.linspace(0, T, steps, device=device)
-        alphas_cumprod = torch.cos(((x / T) + s) / (1 + s) * torch.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clamp(betas, max=0.02)
-
-    def q_sample(self, x0, t):
-        """
-        Forward diffusion: corrupt x0 with noise at timestep t.
-
-        x0: (B, N, D) clean tokens
-        t:  (B,) integer timesteps
-        Returns: (x_t, epsilon) where x_t = √ᾱ_t·x0 + √(1-ᾱ_t)·ε
-        """
-        sqrt_ab = self.sqrt_alpha_bar[t][:, None, None]
-        sqrt_one_minus = self.sqrt_one_minus_alpha_bar[t][:, None, None]
-        eps = torch.randn_like(x0)
-        x_t = sqrt_ab * x0 + sqrt_one_minus * eps
-        return x_t, eps
-
-    def to(self, device):
-        """Move all buffers to the given device."""
-        self.betas = self.betas.to(device)
-        self.alphas = self.alphas.to(device)
-        self.alpha_bar = self.alpha_bar.to(device)
-        self.alpha_bar_prev = self.alpha_bar_prev.to(device)
-        self.sqrt_alpha_bar = self.sqrt_alpha_bar.to(device)
-        self.sqrt_one_minus_alpha_bar = self.sqrt_one_minus_alpha_bar.to(device)
-        self.posterior_variance = self.posterior_variance.to(device)
-        return self
-
-    @torch.no_grad()
-    def p_sample(self, noise_pred, x_t, t, z, temperature=0.98):
-        """
-        Single reverse diffusion step.
-
-        noise_pred: (B, N, D) predicted noise from denoising MLP
-        x_t:        (B, N, D) noisy tokens at timestep t
-        t:          (B,) integer timesteps
-        z:          (B, N, embed_dim) JEPA embeddings (unused in base step,
-                     included for interface compatibility)
-        temperature: sample diversity (τ < 1 reduces variance)
-        Returns: x_{t-1}
-        """
-        t_idx = t[0].item()
-        beta_t = self.betas[t_idx]
-        alpha_t = self.alphas[t_idx]
-        ab_t = self.alpha_bar[t_idx]
-        ab_prev = self.alpha_bar_prev[t_idx]
-
-        # Predicted x0 from noise prediction
-        x0_pred = (x_t - torch.sqrt(1.0 - ab_t) * noise_pred) / torch.sqrt(ab_t)
-        x0_pred = x0_pred.clamp(-1.0, 1.0)
-
-        # Posterior mean
-        mean = (
-            torch.sqrt(ab_prev) * beta_t / (1.0 - ab_t) * x0_pred
-            + torch.sqrt(alpha_t) * (1.0 - ab_prev) / (1.0 - ab_t) * x_t
-        )
-
-        if t_idx == 0:
-            return mean
-
-        noise = torch.randn_like(x_t)
-        variance = torch.sqrt(self.posterior_variance[t_idx]) * temperature
-        return mean + variance * noise
-
-    @torch.no_grad()
-    def p_sample_loop(self, shape, denoise_fn, cond, num_steps=50, temperature=0.98):
-        """
-        Full DDPM reverse process with strided timesteps for efficiency.
-
-        shape:       (B, N, D) latent token shape
-        denoise_fn:  callable (x_t, t, cond) -> noise_pred
-        cond:        (B, N, embed_dim) conditioning from JEPA
-        num_steps:   number of reverse steps (uses stride across full T range)
-        temperature: sample diversity
-        Returns: (B, N, D) denoised latent tokens
-        """
-        B, N, D = shape
-        stride = max(1, self.T // num_steps)
-        timesteps = list(range(self.T - 1, -1, -stride))
-
-        x_t = torch.randn(B, N, D, device=cond.device)
-        for t in timesteps:
-            t_batch = torch.full((B,), t, device=cond.device, dtype=torch.long)
-            eps_pred = denoise_fn(x_t, t_batch, cond)
-            x_t = self.p_sample(eps_pred, x_t, t_batch, cond, temperature)
-        return x_t
+    pred_hf = torch.fft.ifft2(torch.fft.fft2(pred, norm='ortho') * mask, norm='ortho').real
+    tgt_hf = torch.fft.ifft2(torch.fft.fft2(target, norm='ortho') * mask, norm='ortho').real
+    return F.l1_loss(pred_hf, tgt_hf)
