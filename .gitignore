@@ -1,0 +1,38 @@
+# Claude Code local settings
+.claude/
+
+# Project planning
+plan.md
+nplan.md
+summary.md
+checklist.md
+
+# Data directories (large binary files — only top-level)
+/data/
+
+# Model weights and checkpoints
+models/ijepa/
+models/vae/
+models/checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Notebook outputs
+notebooks/smoke_test_output/
+notebooks/*.html
+.ipynb_checkpoints/
+
+# Training artifacts
+runs/
+training_phase*.log
+diagnostic_results.txt
+
+# v3 archive — kept locally, not committed
+urbanjepa_archive.zip
+EXPERIMENTS_REPORT.md
+nPlan.md
+futureplan.md
+models-archive/
