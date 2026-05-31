@@ -1,0 +1,28 @@
+backbone: imagenet_vitb16
+pretrained_path: models/pretrained/imagenet_vitb16.pt
+experiment_name: backbone_imagenet
+
+epochs: 30
+batch_size: 22
+lr: 3.0e-4
+encoder_lr: 1.0e-5
+weight_decay: 0.05
+grad_clip: 1.0
+warmup_epochs: 3
+patches_per_epoch: 128
+val_patches_per_tile: 4
+
+predictor_depth: 6
+decoder_attn_blocks: 4
+decoder_base_dim: 768
+dropout: 0.1
+
+w_l1: 2.0
+w_ssim: 0.5
+w_vgg: 0.5
+w_hf: 0.3
+w_jepa: 0.1
+
+recovery_every: 50
+recovery_slots: 6
+rollback_steps: 200

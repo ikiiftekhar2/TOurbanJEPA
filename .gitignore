@@ -1,19 +1,17 @@
 # Claude Code local settings
 .claude/
 
-# Project planning
-plan.md
-nplan.md
-summary.md
-checklist.md
+# All Markdown files stay strictly local — no docs/plans ever push to GitHub.
+# (.gitignore itself is not .md so this rule does not ignore itself.)
+*.md
 
 # Data directories (large binary files — only top-level)
 /data/
 
-# Model weights and checkpoints
-models/ijepa/
-models/vae/
-models/checkpoints/
+# Model weights and checkpoints (top-level only — src/models/ is code, keep that)
+/models/
+/models-archive/
+/checkpoints/
 
 # Python cache
 __pycache__/
@@ -27,12 +25,14 @@ notebooks/*.html
 
 # Training artifacts
 runs/
+experiments/
 training_phase*.log
 diagnostic_results.txt
 
 # v3 archive — kept locally, not committed
 urbanjepa_archive.zip
-EXPERIMENTS_REPORT.md
-nPlan.md
-futureplan.md
-models-archive/
+
+# Editor/OS
+.DS_Store
+.vscode/
+*.swp
