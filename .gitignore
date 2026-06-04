@@ -4,6 +4,7 @@
 # All Markdown files stay strictly local — no docs/plans ever push to GitHub.
 # (.gitignore itself is not .md so this rule does not ignore itself.)
 *.md
+!README.md
 
 # Data directories (large binary files — only top-level)
 /data/

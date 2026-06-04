@@ -97,7 +97,7 @@ class CheckpointManager:
     def _build_state(self, model, optimizer, scheduler, scaler,
                      epoch: int, batch_idx: int, global_step: int,
                      best_val_psnr: float, config: dict,
-                     ema=None) -> dict:
+                     ema=None, extra_state: Optional[Dict] = None) -> dict:
         state = {
             "epoch": epoch,
             "batch_idx": batch_idx,
@@ -116,12 +116,17 @@ class CheckpointManager:
         # 100k-step run where restarts happen every few hours.
         if ema is not None:
             state["ema"] = ema.state_dict()
+        # GAN stage adds {"discriminator": ..., "d_optimizer": ...} via this
+        # hook so we don't need to thread D args through every save call site.
+        if extra_state:
+            state.update(extra_state)
         return state
 
     def save_step(self, model, optimizer, scheduler, scaler,
                   epoch: int, batch_idx: int, global_step: int,
                   best_val_psnr: float, config: dict,
-                  l1_window: Optional[list] = None, ema=None):
+                  l1_window: Optional[list] = None, ema=None,
+                  extra_state: Optional[Dict] = None):
         """Non-blocking step checkpoint. Clones state to CPU then writes in background.
 
         l1_window: optional list of recent L1 values; restored on resume so the
@@ -133,7 +138,8 @@ class CheckpointManager:
 
         state = self._build_state(model, optimizer, scheduler, scaler,
                                   epoch, batch_idx, global_step,
-                                  best_val_psnr, config, ema=ema)
+                                  best_val_psnr, config, ema=ema,
+                                  extra_state=extra_state)
         if l1_window is not None:
             state["l1_window"] = list(l1_window)
         cpu_state = _clone_to_cpu(state)
@@ -166,13 +172,13 @@ class CheckpointManager:
     def save_epoch(self, model, optimizer, scheduler, scaler,
                    epoch: int, global_step: int, val_psnr: float,
                    best_val_psnr: float, config: dict, extra_metrics: dict = None,
-                   ema=None):
+                   ema=None, extra_state: Optional[Dict] = None):
         """Blocking save at epoch end. Updates 'best' if val_psnr improved."""
         path = self.exp_dir / f"epoch_{epoch}.pt"
         state = self._build_state(model, optimizer, scheduler, scaler,
                                   epoch, batch_idx=0, global_step=global_step,
                                   best_val_psnr=best_val_psnr, config=config,
-                                  ema=ema)
+                                  ema=ema, extra_state=extra_state)
         state["val_psnr"] = val_psnr
         if extra_metrics:
             state["val_metrics"] = extra_metrics

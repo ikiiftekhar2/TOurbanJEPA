@@ -73,6 +73,11 @@ class ModelEMA:
                 self.shadow[name] = p.detach().to(self.device).clone()
                 continue
             live = p.detach().to(self.device, non_blocking=True)
+            # Skip absorbing NaN/Inf — a single bad live tensor permanently
+            # poisons the shadow otherwise (caused v5 Stage A vals 2000+ to NaN
+            # after a transient bf16 underflow in 3 RRDBNet biases).
+            if not torch.isfinite(live).all():
+                continue
             self.shadow[name].mul_(d).add_(live, alpha=1.0 - d)
         return d
 
@@ -107,3 +112,13 @@ class ModelEMA:
         self.decay_end = sd.get("decay_end", self.decay_end)
         self.warmup_steps = sd.get("warmup_steps", self.warmup_steps)
         self.start_step = sd.get("start_step", self.start_step)
+        # Drop any NaN/Inf tensors from the loaded shadow (e.g. v5 Stage A
+        # checkpoints saved before the update-NaN-guard was added). The shadow
+        # entry is removed; the next update() call will re-snapshot from live.
+        dropped = [k for k, v in self.shadow.items()
+                   if torch.is_floating_point(v) and not torch.isfinite(v).all()]
+        for k in dropped:
+            del self.shadow[k]
+        if dropped:
+            print(f"[ema.load] dropped {len(dropped)} NaN/Inf shadow tensors: "
+                  f"{dropped[:5]}{'...' if len(dropped) > 5 else ''}", flush=True)
